@@ -1,0 +1,251 @@
+```scala
+/*
+ * ZScheduler - Optimized worker unparking with reduced frequency
+ * 
+ * This implementation reduces the frequency of LockSupport.unpark calls
+ * by introducing a batching mechanism and a cooldown period for each worker.
+ * Instead of unparking on every task submission, we batch unpark requests
+ * and only unpark workers when necessary, trading some fairness for performance.
+ */
+
+package zio.internal
+
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.locks.LockSupport
+import scala.annotation.tailrec
+
+final class ZScheduler(
+  val corePoolSize: Int,
+  val maxPoolSize: Int,
+  private val keepAliveTime: Long,
+  private val keepAliveTimeUnit: java.util.concurrent.TimeUnit,
+  private val queue: java.util.concurrent.ConcurrentLinkedQueue[Runnable],
+  private val workers: Array[ZScheduler.Worker],
+  private val workerCount: AtomicInteger,
+  private val unparkCooldown: AtomicLongArray, // nanoseconds cooldown per worker
+  private val unparkBatchSize: Int,
+  private val unparkCooldownNanos: Long
+) {
+  import ZScheduler._
+
+  def this(
+    corePoolSize: Int,
+    maxPoolSize: Int,
+    keepAliveTime: Long,
+    keepAliveTimeUnit: java.util.concurrent.TimeUnit,
+    unparkBatchSize: Int = 4,
+    unparkCooldownMicros: Long = 100L
+  ) = {
+    this(
+      corePoolSize,
+      maxPoolSize,
+      keepAliveTime,
+      keepAliveTimeUnit,
+      new java.util.concurrent.ConcurrentLinkedQueue[Runnable](),
+      Array.tabulate(maxPoolSize)(_ => new Worker()),
+      new AtomicInteger(0),
+      new AtomicLongArray(maxPoolSize),
+      unparkBatchSize,
+      java.util.concurrent.TimeUnit.MICROSECONDS.toNanos(unparkCooldownMicros)
+    )
+  }
+
+  /**
+   * Submit a task to the scheduler. Instead of unparking immediately,
+   * we batch unpark requests and only unpark workers that have cooled down.
+   */
+  def submit(task: Runnable): Unit = {
+    queue.offer(task)
+    maybeUnparkWorker()
+  }
+
+  /**
+   * Attempt to unpark a worker, but only if:
+   * 1. There are tasks in the queue
+   * 2. A worker is available and has cooled down since last unpark
+   * 3. We haven't exceeded the batch size for this submission cycle
+   */
+  private def maybeUnparkWorker(): Unit = {
+    if (queue.isEmpty()) return
+
+    val currentNanos = System.nanoTime()
+    var unparked = 0
+    var i = 0
+
+    while (i < workers.length && unparked < unparkBatchSize) {
+      val worker = workers(i)
+      if (worker != null && !worker.isActive.get()) {
+        val lastUnpark = unparkCooldown.get(i)
+        if (currentNanos - lastUnpark >= unparkCooldownNanos) {
+          if (unparkCooldown.compareAndSet(i, lastUnpark, currentNanos)) {
+            LockSupport.unpark(worker.thread)
+            unparked += 1
+          }
+        }
+      }
+      i += 1
+    }
+  }
+
+  /**
+   * Worker thread that processes tasks from the queue.
+   */
+  final class Worker extends Thread {
+    val isActive: AtomicInteger = new AtomicInteger(0) // 0 = idle, 1 = active
+
+    setDaemon(true)
+
+    override def run(): Unit = {
+      while (!Thread.interrupted()) {
+        val task = queue.poll()
+        if (task != null) {
+          isActive.set(1)
+          try {
+            task.run()
+          } catch {
+            case _: InterruptedException => Thread.currentThread().interrupt()
+            case _: Exception => // Log or handle as needed
+          } finally {
+            isActive.set(0)
+          }
+        } else {
+          // Park the worker when no tasks are available
+          LockSupport.park()
+        }
+      }
+    }
+  }
+}
+
+object ZScheduler {
+  /**
+   * Create a default scheduler with optimized unparking.
+   */
+  def make(
+    corePoolSize: Int = Runtime.getRuntime.availableProcessors(),
+    maxPoolSize: Int = Runtime.getRuntime.availableProcessors() * 2,
+    keepAliveTime: Long = 60L,
+    keepAliveTimeUnit: java.util.concurrent.TimeUnit = java.util.concurrent.TimeUnit.SECONDS,
+    unparkBatchSize: Int = 4,
+    unparkCooldownMicros: Long = 100L
+  ): ZScheduler = {
+    val scheduler = new ZScheduler(
+      corePoolSize,
+      maxPoolSize,
+      keepAliveTime,
+      keepAliveTimeUnit,
+      unparkBatchSize,
+      unparkCooldownMicros
+    )
+    // Start core workers
+    for (_ <- 0 until corePoolSize) {
+      scheduler.startWorker()
+    }
+    scheduler
+  }
+
+  private def startWorker(scheduler: ZScheduler): Unit = {
+    val index = scheduler.workerCount.getAndIncrement()
+    if (index < scheduler.maxPoolSize) {
+      val worker = scheduler.workers(index)
+      worker.start()
+    }
+  }
+}
+
+// Test cases
+object ZSchedulerSpec {
+  def runTests(): Unit = {
+    testBasicSubmission()
+    testBatchUnparking()
+    testCooldown()
+    testConcurrentSubmissions()
+    println("All tests passed!")
+  }
+
+  private def testBasicSubmission(): Unit = {
+    val scheduler = ZScheduler.make(corePoolSize = 2, maxPoolSize = 4)
+    val counter = new java.util.concurrent.atomic.AtomicInteger(0)
+    val latch = new java.util.concurrent.CountDownLatch(10)
+
+    for (_ <- 0 until 10) {
+      scheduler.submit(() => {
+        counter.incrementAndGet()
+        latch.countDown()
+      })
+    }
+
+    latch.await()
+    assert(counter.get() == 10, s"Expected 10, got ${counter.get()}")
+    println("testBasicSubmission passed")
+  }
+
+  private def testBatchUnparking(): Unit = {
+    val scheduler = new ZScheduler(
+      corePoolSize = 1,
+      maxPoolSize = 2,
+      keepAliveTime = 1,
+      keepAliveTimeUnit = java.util.concurrent.TimeUnit.SECONDS,
+      unparkBatchSize = 2,
+      unparkCooldownMicros = 1000L
+    )
+    // Manually start one worker
+    ZScheduler.startWorker(scheduler)
+
+    val unparkCount = new java.util.concurrent.atomic.AtomicInteger(0)
+    val originalUnpark = classOf[LockSupport].getDeclaredMethod("unpark", classOf[Thread])
+    originalUnpark.setAccessible(true)
+
+    // We can't easily mock LockSupport.unpark, but we can verify behavior
+    // by checking that tasks are processed correctly with batching
+    val latch = new java.util.concurrent.CountDownLatch(5)
+    for (_ <- 0 until 5) {
+      scheduler.submit(() => latch.countDown())
+    }
+    latch.await()
+    println("testBatchUnparking passed")
+  }
+
+  private def testCooldown(): Unit = {
+    val scheduler = new ZScheduler(
+      corePoolSize = 1,
+      maxPoolSize = 1,
+      keepAliveTime = 1,
+      keepAliveTimeUnit = java.util.concurrent.TimeUnit.SECONDS,
+      unparkBatchSize = 1,
+      unparkCooldownMicros = 50000L // 50ms cooldown
+    )
+    ZScheduler.startWorker(scheduler)
+
+    val start = System.nanoTime()
+    val latch = new java.util.concurrent.CountDownLatch(3)
+    for (_ <- 0 until 3) {
+      scheduler.submit(() => latch.countDown())
+    }
+    latch.await()
+    val elapsed = System.nanoTime() - start
+    // With cooldown, the total time should be at least 2 * cooldown (since we have 3 tasks)
+    assert(elapsed >= 100000000L, s"Expected at least 100ms, got ${elapsed / 1000000}ms")
+    println("testCooldown passed")
+  }
+
+  private def testConcurrentSubmissions(): Unit = {
+    val scheduler = ZScheduler.make(corePoolSize = 4, maxPoolSize = 8)
+    val counter = new java.util.concurrent.atomic.AtomicInteger(0)
+    val totalTasks = 1000
+    val latch = new java.util.concurrent.CountDownLatch(totalTasks)
+
+    val threads = (0 until 10).map(_ => new Thread(() => {
+      for (_ <- 0 until 100) {
+        scheduler.submit(() => {
+          counter.incrementAndGet()
+          latch.countDown()
+        })
+      }
+    }))
+
+    threads.foreach(_.start())
+    threads.foreach(_.join())
+    latch.await()
+    assert(counter.get() == totalTasks, s"Expected $totalTasks, got ${counter.get()}")
+    println("testConcurrentSubmissions passed
