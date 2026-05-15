@@ -1,0 +1,246 @@
+package zio.nio.scheduler
+
+import zio._
+import zio.clock.Clock
+import zio.duration._
+import zio.internal.{Scheduler => ZScheduler}
+import java.util.concurrent.{ConcurrentLinkedQueue, Executors, ThreadFactory}
+import java.util.concurrent.atomic.AtomicBoolean
+import scala.annotation.tailrec
+
+/**
+ * A ZIO scheduler backed by NIO's `Selector` for efficient timer management.
+ * This scheduler uses a single selector thread to manage scheduled tasks,
+ * reducing thread overhead compared to traditional thread-based schedulers.
+ */
+final class NioScheduler private (
+  private val selector: java.nio.channels.Selector,
+  private val taskQueue: ConcurrentLinkedQueue[(Duration, () => Unit)],
+  private val running: AtomicBoolean,
+  private val thread: Thread
+) extends ZScheduler {
+
+  override def schedule(task: () => Unit, duration: Duration): ZScheduler.CancelToken = {
+    val token = new ZScheduler.CancelToken {
+      private val cancelled = new AtomicBoolean(false)
+      override def cancel: UIO[Unit] = UIO.effectTotal {
+        cancelled.set(true)
+      }
+      def isCancelled: Boolean = cancelled.get
+    }
+    taskQueue.offer((duration, () => if (!token.isCancelled) task()))
+    selector.wakeup()
+    token
+  }
+
+  override def shutdown: UIO[Unit] = UIO.effectTotal {
+    running.set(false)
+    selector.wakeup()
+    thread.interrupt()
+  }
+
+  /**
+   * Internal run loop for the selector thread.
+   * Processes scheduled tasks and manages selector timeouts.
+   */
+  private def runLoop: Unit = {
+    import java.nio.channels.SelectionKey
+
+    while (running.get()) {
+      try {
+        // Process all pending tasks
+        drainTasks()
+
+        // Calculate next timeout based on earliest task
+        val timeout = getNextTimeout()
+        val waitTime = timeout.map { t =>
+          val now = java.lang.System.currentTimeMillis()
+          Math.max(0L, t - now)
+        }.getOrElse(0L)
+
+        // Select with timeout (0 means no wait, but we need to handle empty queue)
+        val selected = if (waitTime > 0) {
+          selector.select(waitTime)
+        } else {
+          selector.selectNow()
+        }
+
+        if (selected > 0) {
+          val keys = selector.selectedKeys()
+          val iter = keys.iterator()
+          while (iter.hasNext) {
+            val key = iter.next()
+            iter.remove()
+            // In a real NIO scheduler, we'd handle I/O events here
+            // For timer-only scheduler, we just process tasks
+          }
+        }
+
+        // Process tasks that are due
+        processDueTasks()
+      } catch {
+        case _: InterruptedException =>
+          running.set(false)
+        case _: java.io.IOException =>
+          // Handle selector closure gracefully
+          running.set(false)
+        case _: Exception =>
+          // Log and continue
+          if (running.get()) {
+            // In production, use proper logging
+            System.err.println("NioScheduler error: " + _)
+          }
+      }
+    }
+  }
+
+  private def drainTasks(): Unit = {
+    var task = taskQueue.poll()
+    while (task != null) {
+      val (duration, action) = task
+      val deadline = java.lang.System.currentTimeMillis() + duration.toMillis
+      // Store in a priority structure - for simplicity, we use a simple list
+      // In production, use a priority queue
+      pendingTasks.synchronized {
+        pendingTasks.enqueue((deadline, action))
+      }
+      task = taskQueue.poll()
+    }
+  }
+
+  private val pendingTasks: scala.collection.mutable.PriorityQueue[(Long, () => Unit)] =
+    scala.collection.mutable.PriorityQueue.empty[(Long, () => Unit)](
+      Ordering.by[(Long, () => Unit), Long](_._1).reverse
+    )
+
+  private def processDueTasks(): Unit = {
+    val now = java.lang.System.currentTimeMillis()
+    var continue = true
+    while (continue) {
+      pendingTasks.synchronized {
+        if (pendingTasks.nonEmpty && pendingTasks.head._1 <= now) {
+          val (_, action) = pendingTasks.dequeue()
+          // Execute in a separate thread to avoid blocking selector
+          // In production, use a thread pool
+          val t = new Thread(() => action())
+          t.setDaemon(true)
+          t.start()
+        } else {
+          continue = false
+        }
+      }
+    }
+  }
+
+  private def getNextTimeout(): Option[Long] = {
+    pendingTasks.synchronized {
+      if (pendingTasks.nonEmpty) Some(pendingTasks.head._1)
+      else None
+    }
+  }
+}
+
+object NioScheduler {
+
+  /**
+   * Creates a new NIO-based scheduler.
+   */
+  def create: UIO[NioScheduler] = UIO.effectTotal {
+    val selector = java.nio.channels.Selector.open()
+    val taskQueue = new ConcurrentLinkedQueue[(Duration, () => Unit)]()
+    val running = new AtomicBoolean(true)
+    val scheduler = new NioScheduler(selector, taskQueue, running, null)
+
+    val thread = new Thread(() => scheduler.runLoop, "nio-scheduler")
+    thread.setDaemon(true)
+    thread.start()
+
+    // Use reflection to set the thread field (or make it var)
+    val threadField = classOf[NioScheduler].getDeclaredField("thread")
+    threadField.setAccessible(true)
+    threadField.set(scheduler, thread)
+
+    scheduler
+  }
+
+  /**
+   * Layer that provides a ZIO Scheduler using NIO.
+   */
+  val live: ZLayer[Any, Nothing, Has[ZScheduler]] =
+    ZLayer.fromEffect(create.map(s => Has(s: ZScheduler)))
+}
+
+/**
+ * Test suite for NioScheduler.
+ */
+object NioSchedulerSpec extends DefaultRunnableSpec {
+
+  def spec = suite("NioScheduler")(
+    testM("should execute a task after a delay") {
+      for {
+        scheduler <- NioScheduler.create
+        ref       <- Ref.make(false)
+        _         <- UIO.effectTotal {
+          scheduler.schedule(() => {
+            zio.Runtime.default.unsafeRun(ref.set(true))
+          }, 100.millis)
+        }
+        _         <- TestClock.adjust(200.millis)
+        result    <- ref.get
+      } yield assertTrue(result)
+    },
+    testM("should execute multiple tasks in order") {
+      for {
+        scheduler <- NioScheduler.create
+        ref       <- Ref.make(List.empty[Int])
+        _         <- UIO.effectTotal {
+          scheduler.schedule(() => {
+            zio.Runtime.default.unsafeRun(ref.update(1 :: _))
+          }, 200.millis)
+          scheduler.schedule(() => {
+            zio.Runtime.default.unsafeRun(ref.update(2 :: _))
+          }, 100.millis)
+        }
+        _         <- TestClock.adjust(300.millis)
+        result    <- ref.get
+      } yield assertTrue(result == List(2, 1))
+    },
+    testM("should cancel a scheduled task") {
+      for {
+        scheduler <- NioScheduler.create
+        ref       <- Ref.make(false)
+        token     <- UIO.effectTotal {
+          scheduler.schedule(() => {
+            zio.Runtime.default.unsafeRun(ref.set(true))
+          }, 100.millis)
+        }
+        _         <- token.cancel
+        _         <- TestClock.adjust(200.millis)
+        result    <- ref.get
+      } yield assertTrue(!result)
+    },
+    testM("should handle shutdown gracefully") {
+      for {
+        scheduler <- NioScheduler.create
+        _         <- scheduler.shutdown
+        // After shutdown, scheduling should be a no-op
+        _         <- UIO.effectTotal {
+          scheduler.schedule(() => (), 100.millis)
+        }
+      } yield assertCompletes
+    },
+    testM("should execute tasks with zero delay") {
+      for {
+        scheduler <- NioScheduler.create
+        ref       <- Ref.make(false)
+        _         <- UIO.effectTotal {
+          scheduler.schedule(() => {
+            zio.Runtime.default.unsafeRun(ref.set(true))
+          }, Duration.Zero)
+        }
+        _         <- TestClock.adjust(10.millis)
+        result    <- ref.get
+      } yield assertTrue(result)
+    }
+  )
+}
