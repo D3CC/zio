@@ -1,0 +1,189 @@
+package zio
+
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReferenceArray}
+import scala.annotation.tailrec
+
+/**
+ * A high-performance, lock-free, weak-reference-based concurrent set for fibers.
+ * Designed for Loom-friendly concurrency with minimal synchronization.
+ *
+ * This structure allows concurrent addition and removal of fibers, and eventually
+ * consistent iteration. It uses a striped internal array with CAS operations
+ * to avoid locks, and a reference queue for automatic cleanup of terminated fibers.
+ */
+final class FiberSet[A] private (
+  private val stripes: Int,
+  private val buckets: AtomicReferenceArray[ConcurrentLinkedQueue[WeakRef[A]]],
+  private val refQueue: ReferenceQueue[A],
+  private val size: AtomicInteger
+) {
+
+  /**
+   * Adds a fiber to the set. Returns true if the fiber was added (always true).
+   */
+  def add(fiber: Fiber[A]): Boolean = {
+    val stripe = (fiber.hashCode() & 0x7FFFFFFF) % stripes
+    val bucket = buckets.get(stripe)
+    val weakRef = new WeakRef(fiber, refQueue)
+    bucket.add(weakRef)
+    size.incrementAndGet()
+    cleanStaleRefs()
+    true
+  }
+
+  /**
+   * Removes a fiber from the set. Returns true if the fiber was found and removed.
+   */
+  def remove(fiber: Fiber[A]): Boolean = {
+    val stripe = (fiber.hashCode() & 0x7FFFFFFF) % stripes
+    val bucket = buckets.get(stripe)
+    val iterator = bucket.iterator()
+    while (iterator.hasNext) {
+      val weakRef = iterator.next()
+      val ref = weakRef.get
+      if (ref != null && ref eq fiber) {
+        if (bucket.remove(weakRef)) {
+          size.decrementAndGet()
+          return true
+        }
+      }
+    }
+    false
+  }
+
+  /**
+   * Iterates over all live fibers in the set. The iteration is eventually consistent
+   * and may include fibers that have been removed or terminated during iteration.
+   */
+  def foreach[U](f: Fiber[A] => U): Unit = {
+    var i = 0
+    while (i < stripes) {
+      val bucket = buckets.get(i)
+      val iterator = bucket.iterator()
+      while (iterator.hasNext) {
+        val weakRef = iterator.next()
+        val fiber = weakRef.get
+        if (fiber != null) {
+          f(fiber)
+        }
+      }
+      i += 1
+    }
+  }
+
+  /**
+   * Returns the approximate number of live fibers in the set.
+   */
+  def approximateSize: Int = size.get()
+
+  /**
+   * Cleans up stale weak references that have been garbage collected.
+   */
+  private def cleanStaleRefs(): Unit = {
+    var ref = refQueue.poll()
+    while (ref != null) {
+      val stripe = (ref.hashCode() & 0x7FFFFFFF) % stripes
+      val bucket = buckets.get(stripe)
+      bucket.remove(ref)
+      size.decrementAndGet()
+      ref = refQueue.poll()
+    }
+  }
+}
+
+object FiberSet {
+
+  /**
+   * Creates a new FiberSet with the specified number of stripes.
+   * More stripes reduce contention but increase memory usage.
+   */
+  def make[A](stripes: Int = Runtime.getRuntime.availableProcessors() * 2): FiberSet[A] = {
+    val buckets = new AtomicReferenceArray[ConcurrentLinkedQueue[WeakRef[A]]](stripes)
+    var i = 0
+    while (i < stripes) {
+      buckets.set(i, new ConcurrentLinkedQueue[WeakRef[A]]())
+      i += 1
+    }
+    new FiberSet[A](stripes, buckets, new ReferenceQueue[A], new AtomicInteger(0))
+  }
+}
+
+/**
+ * A weak reference wrapper that uses a reference queue for cleanup.
+ */
+private final class WeakRef[A](referent: Fiber[A], queue: ReferenceQueue[A]) {
+  private val weakRef = new java.lang.ref.WeakReference(referent, queue)
+
+  def get: Fiber[A] = weakRef.get()
+
+  def hashCode(): Int = System.identityHashCode(referent)
+
+  override def equals(obj: Any): Boolean = obj match {
+    case other: WeakRef[_] => weakRef.get() == other.weakRef.get()
+    case _ => false
+  }
+}
+
+/**
+ * A simple reference queue implementation for cleanup of weak references.
+ */
+private final class ReferenceQueue[A] {
+  private val queue = new java.lang.ref.ReferenceQueue[A]()
+
+  def poll(): WeakRef[A] = {
+    val ref = queue.poll()
+    if (ref != null) new WeakRef[A](ref.get().asInstanceOf[Fiber[A]], this) else null
+  }
+}
+
+// Test suite
+object FiberSetSpec extends zio.test.ZIOSpecDefault {
+  import zio.test._
+
+  def spec = suite("FiberSet")(
+    test("add and remove fibers") {
+      for {
+        set <- ZIO.succeed(FiberSet.make[Int]())
+        fiber <- Fiber.succeed(42)
+        _ <- ZIO.succeed(set.add(fiber))
+        size1 <- ZIO.succeed(set.approximateSize)
+        removed <- ZIO.succeed(set.remove(fiber))
+        size2 <- ZIO.succeed(set.approximateSize)
+      } yield assertTrue(size1 == 1 && removed && size2 == 0)
+    },
+    test("iterate over fibers") {
+      for {
+        set <- ZIO.succeed(FiberSet.make[Int]())
+        fiber1 <- Fiber.succeed(1)
+        fiber2 <- Fiber.succeed(2)
+        _ <- ZIO.succeed(set.add(fiber1))
+        _ <- ZIO.succeed(set.add(fiber2))
+        results <- ZIO.succeed {
+          val buf = scala.collection.mutable.ListBuffer[Int]()
+          set.foreach(f => buf += f.unsafeRun())
+          buf.toList
+        }
+      } yield assertTrue(results.contains(1) && results.contains(2))
+    },
+    test("concurrent add and remove") {
+      for {
+        set <- ZIO.succeed(FiberSet.make[Int](4))
+        fibers <- ZIO.foreachPar((1 to 100).toList)(i => Fiber.succeed(i).tap(f => ZIO.succeed(set.add(f))))
+        _ <- ZIO.foreachPar(fibers)(f => ZIO.succeed(set.remove(f)))
+        size <- ZIO.succeed(set.approximateSize)
+      } yield assertTrue(size == 0)
+    },
+    test("cleanup terminated fibers") {
+      for {
+        set <- ZIO.succeed(FiberSet.make[Int]())
+        fiber <- Fiber.succeed(42)
+        _ <- ZIO.succeed(set.add(fiber))
+        _ <- fiber.await // Fiber completes
+        System.gc() // Encourage GC
+        _ <- ZIO.sleep(100.millis) // Allow cleanup
+        size <- ZIO.succeed(set.approximateSize)
+      } yield assertTrue(size == 0)
+    }
+  )
+}
