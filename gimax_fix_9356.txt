@@ -1,0 +1,224 @@
+package zio.nio.scheduler
+
+import zio._
+import zio.clock.Clock
+import zio.duration._
+import zio.internal.Scheduler
+import zio.internal.Scheduler.CancelToken
+
+import java.io.IOException
+import java.nio.channels.{ CancelledKeyException, SelectionKey, Selector }
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.{ ConcurrentHashMap, ConcurrentLinkedQueue }
+import scala.jdk.CollectionConverters._
+
+/**
+ * A ZIO scheduler based on Java NIO Selector for efficient I/O multiplexing.
+ * This scheduler allows ZIO fibers to wait for I/O readiness without blocking threads.
+ */
+final class NioScheduler private (
+  private val selector: Selector,
+  private val pendingTasks: ConcurrentLinkedQueue[() => Unit],
+  private val wakeupNeeded: AtomicBoolean,
+  private val scheduledTasks: ConcurrentHashMap[Long, java.util.List[Runnable]],
+  private val clock: Clock.Service
+) extends Scheduler {
+
+  override def schedule(task: Runnable, duration: Duration): CancelToken = {
+    if (duration.isZero) {
+      pendingTasks.offer(() => task.run())
+      wakeupSelector()
+      CancelToken.empty
+    } else {
+      val deadline = clock.nanoTime() + duration.toNanos
+      val tasks = scheduledTasks.computeIfAbsent(deadline, _ => new java.util.ArrayList[Runnable]())
+      tasks.add(task)
+      wakeupSelector()
+      CancelToken(() => ZIO.effectTotal {
+        tasks.remove(task)
+        if (tasks.isEmpty) scheduledTasks.remove(deadline)
+      })
+    }
+  }
+
+  override def shutdown(): Unit = {
+    selector.keys().asScala.foreach(_.cancel())
+    try selector.close()
+    catch { case _: IOException => }
+  }
+
+  /**
+   * The main event loop that processes I/O events and scheduled tasks.
+   * This should be run on a dedicated thread.
+   */
+  def eventLoop: UIO[Unit] = {
+    def processPendingTasks: UIO[Unit] = ZIO.effectTotal {
+      var task = pendingTasks.poll()
+      while (task != null) {
+        task()
+        task = pendingTasks.poll()
+      }
+    }
+
+    def processScheduledTasks: UIO[Unit] = ZIO.effectTotal {
+      val now = clock.nanoTime()
+      val iterator = scheduledTasks.entrySet().iterator()
+      while (iterator.hasNext) {
+        val entry = iterator.next()
+        if (entry.getKey <= now) {
+          entry.getValue.asScala.foreach(_.run())
+          iterator.remove()
+        }
+      }
+    }
+
+    def processSelectedKeys: UIO[Unit] = ZIO.effectTotal {
+      val selectedKeys = selector.selectedKeys()
+      val iterator = selectedKeys.iterator()
+      while (iterator.hasNext) {
+        val key = iterator.next()
+        iterator.remove()
+        try {
+          if (key.isValid) {
+            val attachment = key.attachment()
+            if (attachment != null) {
+              attachment match {
+                case runnable: Runnable => runnable.run()
+                case _                 => // ignore unknown attachments
+              }
+            }
+          }
+        } catch {
+          case _: CancelledKeyException => // key was cancelled, ignore
+        }
+      }
+    }
+
+    (processPendingTasks *> processScheduledTasks *> processSelectedKeys).forever
+  }
+
+  /**
+   * Registers a channel with the selector for specific I/O operations.
+   */
+  def registerChannel(
+    channel: java.nio.channels.SelectableChannel,
+    ops: Int,
+    attachment: AnyRef
+  ): IO[IOException, Unit] = {
+    ZIO.effect {
+      channel.configureBlocking(false)
+      channel.register(selector, ops, attachment)
+    }.refineToOrDie[IOException]
+  }
+
+  private def wakeupSelector(): Unit = {
+    if (wakeupNeeded.compareAndSet(false, true)) {
+      selector.wakeup()
+    }
+  }
+}
+
+object NioScheduler {
+
+  /**
+   * Creates a new NioScheduler with the given clock service.
+   */
+  def create(clock: Clock.Service): UIO[NioScheduler] = ZIO.effectTotal {
+    val selector = Selector.open()
+    val pendingTasks = new ConcurrentLinkedQueue[() => Unit]()
+    val wakeupNeeded = new AtomicBoolean(false)
+    val scheduledTasks = new ConcurrentHashMap[Long, java.util.List[Runnable]]()
+    new NioScheduler(selector, pendingTasks, wakeupNeeded, scheduledTasks, clock)
+  }
+
+  /**
+   * Creates a new NioScheduler using the default ZIO clock.
+   */
+  val live: UIO[NioScheduler] = ZIO.accessM[Clock](_.get).flatMap(create)
+
+  /**
+   * Runs the event loop on a separate fiber.
+   */
+  def runEventLoop(scheduler: NioScheduler): UIO[Fiber[Nothing, Unit]] = {
+    scheduler.eventLoop.fork
+  }
+}
+
+// Test cases
+object NioSchedulerSpec extends DefaultRunnableSpec {
+
+  def spec = suite("NioScheduler")(
+    testM("should schedule and execute immediate tasks") {
+      for {
+        clock   <- ZIO.access[Clock](_.get)
+        scheduler <- NioScheduler.create(clock)
+        fiber   <- NioScheduler.runEventLoop(scheduler)
+        ref     <- Ref.make(false)
+        _       <- ZIO.effectTotal(scheduler.schedule(() => ref.set(true).run, Duration.Zero))
+        _       <- TestClock.adjust(1.millis)
+        result  <- ref.get
+        _       <- fiber.interrupt
+      } yield assertTrue(result)
+    },
+    testM("should schedule and execute delayed tasks") {
+      for {
+        clock   <- ZIO.access[Clock](_.get)
+        scheduler <- NioScheduler.create(clock)
+        fiber   <- NioScheduler.runEventLoop(scheduler)
+        ref     <- Ref.make(false)
+        _       <- ZIO.effectTotal(scheduler.schedule(() => ref.set(true).run, 10.millis))
+        _       <- TestClock.adjust(10.millis)
+        result  <- ref.get
+        _       <- fiber.interrupt
+      } yield assertTrue(result)
+    },
+    testM("should cancel scheduled tasks") {
+      for {
+        clock   <- ZIO.access[Clock](_.get)
+        scheduler <- NioScheduler.create(clock)
+        fiber   <- NioScheduler.runEventLoop(scheduler)
+        ref     <- Ref.make(false)
+        cancel  <- ZIO.effectTotal(scheduler.schedule(() => ref.set(true).run, 10.millis))
+        _       <- cancel
+        _       <- TestClock.adjust(10.millis)
+        result  <- ref.get
+        _       <- fiber.interrupt
+      } yield assertTrue(!result)
+    },
+    testM("should handle multiple scheduled tasks") {
+      for {
+        clock   <- ZIO.access[Clock](_.get)
+        scheduler <- NioScheduler.create(clock)
+        fiber   <- NioScheduler.runEventLoop(scheduler)
+        ref1    <- Ref.make(false)
+        ref2    <- Ref.make(false)
+        _       <- ZIO.effectTotal(scheduler.schedule(() => ref1.set(true).run, 5.millis))
+        _       <- ZIO.effectTotal(scheduler.schedule(() => ref2.set(true).run, 10.millis))
+        _       <- TestClock.adjust(5.millis)
+        result1 <- ref1.get
+        result2 <- ref2.get
+        _       <- TestClock.adjust(5.millis)
+        result3 <- ref2.get
+        _       <- fiber.interrupt
+      } yield assertTrue(result1 && !result2 && result3)
+    },
+    testM("should register and process channel events") {
+      for {
+        clock   <- ZIO.access[Clock](_.get)
+        scheduler <- NioScheduler.create(clock)
+        fiber   <- NioScheduler.runEventLoop(scheduler)
+        pair    <- ZIO.effectTotal(java.nio.channels.Pipe.open())
+        ref     <- Ref.make(false)
+        _       <- scheduler.registerChannel(pair.source(), SelectionKey.OP_READ, () => ref.set(true).run)
+        _       <- ZIO.effectTotal {
+          pair.sink().write(java.nio.ByteBuffer.wrap(Array[Byte](1)))
+        }
+        _       <- TestClock.adjust(1.millis)
+        result  <- ref.get
+        _       <- fiber.interrupt
+        _       <- ZIO.effectTotal(pair.source().close())
+        _       <- ZIO.effectTotal(pair.sink().close())
+      } yield assertTrue(result)
+    }
+  )
+}
