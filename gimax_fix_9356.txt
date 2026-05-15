@@ -1,0 +1,127 @@
+package zio.nio
+
+import zio._
+import zio.clock.Clock
+import zio.duration.Duration
+
+import java.io.IOException
+import java.nio.channels.{ SelectableChannel, SelectionKey, Selector => JSelector }
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * A ZIO-based NIO scheduler that uses a single selector to manage multiple channels.
+ * This scheduler provides a functional, composable way to handle I/O events.
+ */
+trait NioScheduler {
+  def schedule(channel: SelectableChannel, ops: Int): ZIO[Clock, IOException, NioRegistration]
+}
+
+trait NioRegistration {
+  def cancel: UIO[Unit]
+  def interestOps(ops: Int): UIO[Unit]
+  def readyOps: UIO[Int]
+}
+
+object NioScheduler {
+
+  /**
+   * Creates a new NIO scheduler that runs on a dedicated fiber.
+   */
+  def make: ZManaged[Clock, IOException, NioScheduler] =
+    for {
+      selector <- ZManaged.fromAutoCloseable(ZIO.effect(JSelector.open()).refineToOrDie[IOException])
+      running  <- ZManaged.makeEffectTotal(new AtomicBoolean(true))(_.set(false))
+      fiber    <- ZManaged.fromZIO(selectLoop(selector, running).fork)
+      _        <- ZManaged.make(ZIO.unit)(_ => fiber.interrupt *> ZIO.effectTotal(running.set(false)))
+    } yield new LiveNioScheduler(selector, running)
+
+  private def selectLoop(selector: JSelector, running: AtomicBoolean): URIO[Clock, Nothing] = {
+    def loop: URIO[Clock, Nothing] =
+      ZIO.effect(selector.select(100)).catchAll(_ => ZIO.unit).flatMap { selected =>
+        if (selected > 0) {
+          val keys = selector.selectedKeys()
+          val iter = keys.iterator()
+          while (iter.hasNext) {
+            val key = iter.next()
+            iter.remove()
+            if (key.isValid) {
+              val attachment = key.attachment().asInstanceOf[Promise[IOException, Int]]
+              attachment.succeed(key.readyOps()).ignore
+            }
+          }
+        }
+        if (running.get()) loop else ZIO.never
+      }
+
+    loop
+  }
+
+  private class LiveNioScheduler(selector: JSelector, running: AtomicBoolean) extends NioScheduler {
+    override def schedule(channel: SelectableChannel, ops: Int): ZIO[Clock, IOException, NioRegistration] =
+      for {
+        promise <- Promise.make[IOException, Int]
+        _       <- ZIO.effect {
+          channel.configureBlocking(false)
+          val key = channel.register(selector, ops, promise)
+          selector.wakeup()
+          key
+        }.refineToOrDie[IOException]
+      } yield new LiveNioRegistration(channel, selector, promise, ops)
+  }
+
+  private class LiveNioRegistration(
+    channel: SelectableChannel,
+    selector: JSelector,
+    promise: Promise[IOException, Int],
+    initialOps: Int
+  ) extends NioRegistration {
+    private val opsRef = new java.util.concurrent.atomic.AtomicInteger(initialOps)
+
+    override def cancel: UIO[Unit] =
+      ZIO.effectTotal {
+        val key = channel.keyFor(selector)
+        if (key ne null) key.cancel()
+        selector.wakeup()
+      }
+
+    override def interestOps(ops: Int): UIO[Unit] =
+      ZIO.effectTotal {
+        opsRef.set(ops)
+        val key = channel.keyFor(selector)
+        if (key ne null) {
+          key.interestOps(ops)
+          selector.wakeup()
+        }
+      }
+
+    override def readyOps: UIO[Int] =
+      promise.await.retry(Schedule.recurWhile(_ == 0))
+  }
+}
+
+object NioSchedulerExample extends App {
+  import zio.console._
+
+  def run(args: List[String]): URIO[zio.ZEnv, ExitCode] = {
+    val program = for {
+      scheduler <- NioScheduler.make.use { scheduler =>
+        // Example usage with a ServerSocketChannel
+        import java.net.InetSocketAddress
+        import java.nio.channels.ServerSocketChannel
+
+        for {
+          serverChannel <- ZIO.effect(ServerSocketChannel.open()).refineToOrDie[IOException]
+          _             <- ZIO.effect(serverChannel.bind(new InetSocketAddress(8080))).refineToOrDie[IOException]
+          registration  <- scheduler.schedule(serverChannel, SelectionKey.OP_ACCEPT)
+          _             <- putStrLn("Server started on port 8080, waiting for connections...")
+          readyOps      <- registration.readyOps
+          _             <- putStrLn(s"Ready ops: $readyOps")
+          _             <- registration.cancel
+          _             <- ZIO.effect(serverChannel.close()).refineToOrDie[IOException]
+        } yield ()
+      }
+    } yield ()
+
+    program.exitCode
+  }
+}
