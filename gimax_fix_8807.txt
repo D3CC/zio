@@ -1,0 +1,143 @@
+package zio.internal
+
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+import java.util.concurrent.locks.LockSupport
+import scala.annotation.tailrec
+
+/**
+ * A specialized, single-reader, multiple-writer mailbox optimized for ZIO fiber run loops.
+ *
+ * Design:
+ * - Fixed-size ring buffer of 4 entries for the common case (extremely small mailboxes).
+ * - Overflow grows into a linked list of nodes, each holding up to 4 entries.
+ * - Write position tracked via AtomicInteger (shared across writers).
+ * - Read position tracked via plain volatile long (single reader, no contention).
+ * - Spin-looping with backoff for rare race conditions (e.g., writer vs reader on overflow).
+ * - `isEmpty` is approximate (may return false negative under concurrent writes), acceptable for run loop.
+ */
+final class FiberMailbox[A] private (
+  private val initialCapacity: Int = 4
+) {
+  import FiberMailbox._
+
+  // Ring buffer slots
+  private val buffer: Array[AnyRef] = new Array[AnyRef](initialCapacity)
+  // Overflow linked list head (lazily created)
+  private val overflowHead: AtomicReference[OverflowNode[A]] = new AtomicReference(null)
+  // Write position (monotonically increasing, shared across writers)
+  private val writePos: AtomicInteger = new AtomicInteger(0)
+  // Read position (only accessed by single reader thread)
+  @volatile private var readPos: Long = 0L
+
+  /**
+   * Enqueue an element. Multiple writers can call this concurrently.
+   */
+  final def enqueue(a: A): Unit = {
+    val wp = writePos.getAndIncrement()
+    val idx = (wp & (initialCapacity - 1)).toInt // mask for power-of-two size
+    if (idx < initialCapacity) {
+      // Fast path: write to ring buffer
+      buffer(idx) = a.asInstanceOf[AnyRef]
+      // Ensure visibility for reader (volatile write on writePos already provides happens-before)
+    } else {
+      // Slow path: overflow into linked list
+      val node = new OverflowNode[A]()
+      val slot = (wp - initialCapacity) & (OverflowNode.Capacity - 1)
+      node.buffer(slot) = a.asInstanceOf[AnyRef]
+      // Atomically append to overflow list
+      var current = overflowHead.get()
+      while (!overflowHead.compareAndSet(current, node)) {
+        current = overflowHead.get()
+        // Spin with backoff (rare)
+        LockSupport.parkNanos(1L)
+      }
+      // Link previous overflow node if exists
+      if (current ne null) {
+        current.next = node
+      }
+    }
+  }
+
+  /**
+   * Dequeue an element. Only the single reader thread should call this.
+   * Returns `null` if mailbox is empty (approximate).
+   */
+  final def dequeue(): A = {
+    val rp = readPos
+    val idx = (rp & (initialCapacity - 1)).toInt
+    if (idx < initialCapacity) {
+      val elem = buffer(idx)
+      if (elem ne null) {
+        buffer(idx) = null // allow GC
+        readPos = rp + 1L
+        elem.asInstanceOf[A]
+      } else {
+        null.asInstanceOf[A]
+      }
+    } else {
+      // Read from overflow
+      val overflowIdx = (rp - initialCapacity).toInt
+      val node = findOverflowNode(overflowIdx / OverflowNode.Capacity)
+      if (node ne null) {
+        val slot = overflowIdx & (OverflowNode.Capacity - 1)
+        val elem = node.buffer(slot)
+        if (elem ne null) {
+          node.buffer(slot) = null
+          readPos = rp + 1L
+          elem.asInstanceOf[A]
+        } else {
+          null.asInstanceOf[A]
+        }
+      } else {
+        null.asInstanceOf[A]
+      }
+    }
+  }
+
+  /**
+   * Approximate emptiness check. May return false negative under concurrent writes.
+   * Suitable for fiber run loop decisions.
+   */
+  final def isEmpty(): Boolean = {
+    val rp = readPos
+    val wp = writePos.get()
+    rp >= wp
+  }
+
+  /**
+   * Drain all elements into a list (for testing / cleanup).
+   */
+  final def drainAll(): List[A] = {
+    val builder = List.newBuilder[A]
+    var elem = dequeue()
+    while (elem ne null.asInstanceOf[A]) {
+      builder += elem
+      elem = dequeue()
+    }
+    builder.result()
+  }
+
+  // Find overflow node by index (0-based)
+  private def findOverflowNode(index: Int): OverflowNode[A] = {
+    var node = overflowHead.get()
+    var i = 0
+    while ((node ne null) && i < index) {
+      node = node.next
+      i += 1
+    }
+    node
+  }
+}
+
+object FiberMailbox {
+  private final class OverflowNode[A] {
+    val buffer: Array[AnyRef] = new Array[AnyRef](Capacity)
+    @volatile var next: OverflowNode[A] = null
+  }
+
+  private object OverflowNode {
+    final val Capacity: Int = 4
+  }
+
+  def apply[A](): FiberMailbox[A] = new FiberMailbox[A]()
+}
