@@ -1,0 +1,162 @@
+package zio.internal
+
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import scala.annotation.tailrec
+
+/**
+ * A specialized, single-reader, multi-writer mailbox optimized for ZIO fiber run loop workloads.
+ *
+ * Design:
+ * - Core representation: fixed-size array of 4 slots (fast path) + growable linked list (overflow)
+ * - Write position tracked via AtomicInteger (shared among writers)
+ * - Read position tracked via plain Int (only single reader)
+ * - Spin-looping for rare race conditions on overflow
+ * - No precise isEmpty needed for run loop; approximate check via comparing positions
+ */
+final class FiberMailbox[A] private (
+  private val slots: Array[AnyRef],
+  private val writePos: AtomicInteger,
+  private var readPos: Int,
+  private val overflow: AtomicReference[Node[A]]
+) {
+  import FiberMailbox._
+
+  private def this() = this(
+    new Array[AnyRef](FixedCapacity),
+    new AtomicInteger(0),
+    0,
+    new AtomicReference[Node[A]](null)
+  )
+
+  /**
+   * Enqueue an element. Called by multiple writers concurrently.
+   */
+  def enqueue(a: A): Unit = {
+    val wp = writePos.getAndIncrement()
+    if (wp < FixedCapacity) {
+      // Fast path: write directly into fixed slot
+      slots(wp) = a
+    } else {
+      // Slow path: append to overflow linked list
+      val node = new Node(a)
+      @tailrec def retry(): Unit = {
+        val tail = overflow.get()
+        if (overflow.compareAndSet(tail, node)) {
+          if (tail ne null) tail.next = node
+        } else retry()
+      }
+      retry()
+    }
+  }
+
+  /**
+   * Dequeue an element. Called only by the single reader (fiber).
+   * Returns null if mailbox is empty.
+   */
+  def dequeue(): A = {
+    val rp = readPos
+    if (rp < FixedCapacity) {
+      // Try to read from fixed slots
+      val value = slots(rp)
+      if (value ne null) {
+        slots(rp) = null // allow GC
+        readPos = rp + 1
+        value.asInstanceOf[A]
+      } else {
+        // Slot not yet written; check overflow
+        dequeueOverflow()
+      }
+    } else {
+      dequeueOverflow()
+    }
+  }
+
+  private def dequeueOverflow(): A = {
+    val head = overflow.get()
+    if (head ne null) {
+      // Try to CAS from head to head.next
+      if (overflow.compareAndSet(head, head.next)) {
+        head.next = null // help GC
+        head.value
+      } else {
+        // Race condition: another writer just updated overflow; spin-loop
+        // This is extremely rare; spin a few times then retry
+        var spin = 0
+        while (spin < SpinLimit) {
+          val h = overflow.get()
+          if (h ne null) {
+            if (overflow.compareAndSet(h, h.next)) {
+              h.next = null
+              return h.value
+            }
+          }
+          spin += 1
+        }
+        // Fallback: should not happen under normal contention; retry recursively
+        dequeueOverflow()
+      }
+    } else {
+      null.asInstanceOf[A]
+    }
+  }
+
+  /**
+   * Approximate emptiness check. May return false even if empty due to concurrent writes.
+   * Suitable for run loop scheduling decisions.
+   */
+  def isEmptyApprox: Boolean = {
+    val rp = readPos
+    if (rp < FixedCapacity) slots(rp) eq null
+    else overflow.get() eq null
+  }
+
+  /**
+   * Precise emptiness check (more expensive). Used when exact answer needed.
+   */
+  def isEmpty: Boolean = {
+    val rp = readPos
+    if (rp < FixedCapacity) {
+      // Check all remaining fixed slots
+      var i = rp
+      while (i < FixedCapacity) {
+        if (slots(i) ne null) return false
+        i += 1
+      }
+      overflow.get() eq null
+    } else {
+      overflow.get() eq null
+    }
+  }
+
+  /**
+   * Number of elements in mailbox (approximate, for debugging).
+   */
+  def size: Int = {
+    val wp = writePos.get()
+    val rp = readPos
+    val fixedCount = math.min(wp, FixedCapacity) - rp
+    if (fixedCount < 0) 0 else fixedCount + overflowSize()
+  }
+
+  private def overflowSize(): Int = {
+    var node = overflow.get()
+    var count = 0
+    while (node ne null) {
+      count += 1
+      node = node.next
+    }
+    count
+  }
+}
+
+object FiberMailbox {
+  private final val FixedCapacity = 4
+  private final val SpinLimit = 10
+
+  private final class Node[A](val value: A) {
+    var next: Node[A] = null
+  }
+
+  def apply[A](): FiberMailbox[A] = new FiberMailbox[A]()
+}
